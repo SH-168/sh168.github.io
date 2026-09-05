@@ -12,6 +12,7 @@
       --border:#2f2f35; --danger:#eb0400;
     }
     *{box-sizing:border-box}
+    [hidden]{display:none !important}
     body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
     header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
     header h1{font-size:18px;margin:0;margin-right:auto}
@@ -35,8 +36,9 @@
     .now{font-size:18px;font-weight:700;margin:8px 0 3px}
     .title{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .player-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
-    iframe{width:100%;height:100%;border:0}\n    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;}
-    .empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
+    iframe{width:100%;height:100%;border:0}
+    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;}
+    .empty{pointer-events:none;position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
     .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
     .small{font-size:12px;color:var(--muted)}
     code{background:#111;padding:2px 5px;border-radius:4px}
@@ -93,19 +95,18 @@
       </div>
     </div>
     <div id="twitchPlayer" style="width:100%;height:100%;" hidden></div>
-    <button id="startPlaybackBtn" class="primary" hidden
-      style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:20;padding:14px 20px;font-size:16px;">
-      ▶ 音声ONで連続再生
-    </button>
+
   </div>
 
   <div class="controls">
+    <button id="startPlaybackBtn" class="primary" hidden disabled>▶ 音声ONで再生</button>
     <button id="nextBtn" disabled>⏭ 次のLIVE</button>
     <button id="refreshBtn" disabled>↻ 今すぐ再チェック</button>
     <button id="openBtn" disabled>↗ Twitchで開く</button>
   </div>
   <p class="small">
-    初回だけ「▶ 音声ONで連続再生」を押してください。その後は同じTwitch Playerのままチャンネルを切り替えます。<br>
+    「▶ 音声ONで再生」を押してください。再生が始まらない場合は、動画左下の▶とスピーカーを直接操作してください。<br>
+    配信の切替には同じプレイヤーを使います。ブラウザの制限により、再度操作が必要になる場合があります。<br>
     60秒ごとにフォロー中LIVEを再取得します。現在の配信が終了したら別のLIVEへ自動切替。
     誰も配信していない場合は待機を続けます。
   </p>
@@ -137,7 +138,7 @@
   let nextPollAt = 0;
   let twitchPlayer = null;
   let playerReady = false;
-  let audioActivated = sessionStorage.getItem("twitch_audio_activated") === "1";
+  let audioActivated = false; // ページを開くたびに音声付き再生の許可を確認する
 
   const redirectUri = location.origin + location.pathname;
   els.redirectPreview.textContent = redirectUri;
@@ -238,7 +239,9 @@
   function ensurePlayer(initialChannel) {
     if (twitchPlayer) return twitchPlayer;
 
+    if (!window.Twitch?.Player) throw new Error("Twitchプレイヤーを読み込めません。ページを再読み込みしてください。");
     els.twitchPlayer.hidden = false;
+    els.startPlayback.disabled = true;
     twitchPlayer = new Twitch.Player("twitchPlayer", {
       width: "100%",
       height: "100%",
@@ -250,18 +253,33 @@
 
     twitchPlayer.addEventListener(Twitch.Player.READY, () => {
       playerReady = true;
-      twitchPlayer.setMuted(!audioActivated);
-      try { twitchPlayer.play(); } catch (_) {}
-      if (!audioActivated) els.startPlayback.hidden = false;
+      els.startPlayback.disabled = false;
+      if (!current) { twitchPlayer.pause(); return; }
+      twitchPlayer.setChannel(current.user_login);
+      twitchPlayer.setMuted(true);
+      els.startPlayback.hidden = false;
+      try { twitchPlayer.play(); } catch (_) {
+        setStatus("動画左下の▶で再生してください", "wait");
+      }
     });
 
     twitchPlayer.addEventListener(Twitch.Player.PLAYING, () => {
-      if (current) setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
+      if (!current) { twitchPlayer.pause(); return; }
+      audioActivated = !twitchPlayer.getMuted();
+      els.startPlayback.hidden = audioActivated;
+      setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
     });
 
     twitchPlayer.addEventListener(Twitch.Player.PLAYBACK_BLOCKED, () => {
       els.startPlayback.hidden = false;
-      setStatus("再生には最初の1クリックが必要です", "wait");
+      setStatus("再生がブロックされました。動画左下の▶とスピーカーを直接操作してください", "wait");
+    });
+
+    twitchPlayer.addEventListener(Twitch.Player.PAUSE, () => {
+      if (current) {
+        els.startPlayback.hidden = false;
+        setStatus("一時停止中 — 動画左下の▶で再開できます", "wait");
+      }
     });
 
     twitchPlayer.addEventListener(Twitch.Player.OFFLINE, () => {
@@ -288,7 +306,7 @@
     els.viewerCount.textContent = "👀 " + Number(s.viewer_count).toLocaleString() + "人";
     els.liveCount.textContent = "🟣 フォロー中LIVE " + liveStreams.length + "件";
     els.open.disabled = false;
-    setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
+    setStatus("配信を読み込み中…", "wait");
 
     els.empty.hidden = true;
     els.twitchPlayer.hidden = false;
@@ -296,8 +314,8 @@
     if (!twitchPlayer) {
       ensurePlayer(s.user_login);
     } else if (previousLogin !== s.user_login) {
-      twitchPlayer.setChannel(s.user_login);
       if (playerReady) {
+        twitchPlayer.setChannel(s.user_login);
         twitchPlayer.setMuted(!audioActivated);
         try { twitchPlayer.play(); } catch (_) {}
       }
@@ -400,13 +418,21 @@
   });
 
   els.startPlayback.addEventListener("click", () => {
-    if (!twitchPlayer) return;
-    audioActivated = true;
-    sessionStorage.setItem("twitch_audio_activated", "1");
-    twitchPlayer.setMuted(false);
-    try { twitchPlayer.play(); } catch (_) {}
-    els.startPlayback.hidden = true;
-    setStatus("連続再生中", "live");
+    if (!twitchPlayer || !playerReady || !current) return;
+    setStatus("音声付き再生を開始しています…", "wait");
+    try {
+      twitchPlayer.setMuted(false);
+      twitchPlayer.setVolume(1);
+      twitchPlayer.play();
+      audioActivated = true;
+      if (!twitchPlayer.isPaused()) {
+        els.startPlayback.hidden = true;
+        setStatus("連続再生中", "live");
+      }
+    } catch (e) {
+      els.startPlayback.hidden = false;
+      setStatus("動画左下の▶とスピーカーを直接操作してください", "wait");
+    }
   });
 
   els.logout.addEventListener("click", () => {
