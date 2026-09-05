@@ -35,13 +35,14 @@
     .now{font-size:18px;font-weight:700;margin:8px 0 3px}
     .title{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .player-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
-    iframe{width:100%;height:100%;border:0}
+    iframe{width:100%;height:100%;border:0}\n    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;}
     .empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
     .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
     .small{font-size:12px;color:var(--muted)}
     code{background:#111;padding:2px 5px;border-radius:4px}
     @media (max-width:700px){.setup{grid-template-columns:1fr}.player-wrap{aspect-ratio:9/16;max-height:75vh}}
   </style>
+  <script src="https://player.twitch.tv/js/embed/v1.js"></script>
 </head>
 <body>
 <header>
@@ -91,7 +92,11 @@
         ログイン後、配信中がいなければ待機して定期巡回します。
       </div>
     </div>
-    <iframe id="player" allowfullscreen allow="autoplay; fullscreen" hidden></iframe>
+    <div id="twitchPlayer" style="width:100%;height:100%;" hidden></div>
+    <button id="startPlaybackBtn" class="primary" hidden
+      style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:20;padding:14px 20px;font-size:16px;">
+      ▶ 音声ONで連続再生
+    </button>
   </div>
 
   <div class="controls">
@@ -100,6 +105,7 @@
     <button id="openBtn" disabled>↗ Twitchで開く</button>
   </div>
   <p class="small">
+    初回だけ「▶ 音声ONで連続再生」を押してください。その後は同じTwitch Playerのままチャンネルを切り替えます。<br>
     60秒ごとにフォロー中LIVEを再取得します。現在の配信が終了したら別のLIVEへ自動切替。
     誰も配信していない場合は待機を続けます。
   </p>
@@ -114,7 +120,7 @@
   const els = {
     clientId: $("clientId"), login: $("loginBtn"), logout: $("logoutBtn"),
     save: $("saveBtn"), setup: $("setupCard"), statusDot: $("statusDot"),
-    statusText: $("statusText"), pollText: $("pollText"), player: $("player"),
+    statusText: $("statusText"), pollText: $("pollText"), twitchPlayer: $("twitchPlayer"), startPlayback: $("startPlaybackBtn"),
     empty: $("emptyState"), next: $("nextBtn"), refresh: $("refreshBtn"),
     open: $("openBtn"), streamInfo: $("streamInfo"), streamerName: $("streamerName"),
     streamTitle: $("streamTitle"), gameName: $("gameName"),
@@ -129,6 +135,9 @@
   let pollTimer = null;
   let countdownTimer = null;
   let nextPollAt = 0;
+  let twitchPlayer = null;
+  let playerReady = false;
+  let audioActivated = sessionStorage.getItem("twitch_audio_activated") === "1";
 
   const redirectUri = location.origin + location.pathname;
   els.redirectPreview.textContent = redirectUri;
@@ -226,7 +235,51 @@
     return pool[Math.floor(Math.random() * pool.length)];
   }
 
+  function ensurePlayer(initialChannel) {
+    if (twitchPlayer) return twitchPlayer;
+
+    els.twitchPlayer.hidden = false;
+    twitchPlayer = new Twitch.Player("twitchPlayer", {
+      width: "100%",
+      height: "100%",
+      channel: initialChannel,
+      parent: [location.hostname],
+      autoplay: true,
+      muted: true
+    });
+
+    twitchPlayer.addEventListener(Twitch.Player.READY, () => {
+      playerReady = true;
+      twitchPlayer.setMuted(!audioActivated);
+      try { twitchPlayer.play(); } catch (_) {}
+      if (!audioActivated) els.startPlayback.hidden = false;
+    });
+
+    twitchPlayer.addEventListener(Twitch.Player.PLAYING, () => {
+      if (current) setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
+    });
+
+    twitchPlayer.addEventListener(Twitch.Player.PLAYBACK_BLOCKED, () => {
+      els.startPlayback.hidden = false;
+      setStatus("再生には最初の1クリックが必要です", "wait");
+    });
+
+    twitchPlayer.addEventListener(Twitch.Player.OFFLINE, () => {
+      if (current) {
+        setStatus("配信終了 → 次を探しています…", "wait");
+        setTimeout(() => refresh({forcePick:true}), 1200);
+      }
+    });
+
+    twitchPlayer.addEventListener(Twitch.Player.ENDED, () => {
+      if (current) setTimeout(() => refresh({forcePick:true}), 1200);
+    });
+
+    return twitchPlayer;
+  }
+
   function showStream(s) {
+    const previousLogin = current?.user_login || "";
     current = s;
     els.streamInfo.hidden = false;
     els.streamerName.textContent = s.user_name;
@@ -235,25 +288,32 @@
     els.viewerCount.textContent = "👀 " + Number(s.viewer_count).toLocaleString() + "人";
     els.liveCount.textContent = "🟣 フォロー中LIVE " + liveStreams.length + "件";
     els.open.disabled = false;
-    setStatus("再生中", "live");
+    setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
 
-    // Twitch Embed の parent は現在のホスト名を指定
-    const params = new URLSearchParams({
-      channel: s.user_login,
-      parent: location.hostname,
-      autoplay: "true",
-      muted: "false"
-    });
-    els.player.src = "https://player.twitch.tv/?" + params.toString();
-    els.player.hidden = false;
     els.empty.hidden = true;
+    els.twitchPlayer.hidden = false;
+
+    if (!twitchPlayer) {
+      ensurePlayer(s.user_login);
+    } else if (previousLogin !== s.user_login) {
+      twitchPlayer.setChannel(s.user_login);
+      if (playerReady) {
+        twitchPlayer.setMuted(!audioActivated);
+        try { twitchPlayer.play(); } catch (_) {}
+      }
+    }
+
+    els.startPlayback.hidden = audioActivated;
     document.title = "▶ " + s.user_name + " | Twitch Endless Follow TV";
   }
 
   function showWaiting() {
     current = null;
-    els.player.src = "about:blank";
-    els.player.hidden = true;
+    if (twitchPlayer && playerReady) {
+      try { twitchPlayer.pause(); } catch (_) {}
+    }
+    els.twitchPlayer.hidden = true;
+    els.startPlayback.hidden = true;
     els.empty.hidden = false;
     els.empty.innerHTML = `<div><div style="font-size:42px">🐧💤</div><strong>いま配信中のフォロー先はいません</strong><br>そのまま待機して、自動で見つけにいきます。</div>`;
     els.streamInfo.hidden = true;
@@ -339,10 +399,25 @@
     location.href = "https://id.twitch.tv/oauth2/authorize?" + q.toString();
   });
 
+  els.startPlayback.addEventListener("click", () => {
+    if (!twitchPlayer) return;
+    audioActivated = true;
+    sessionStorage.setItem("twitch_audio_activated", "1");
+    twitchPlayer.setMuted(false);
+    try { twitchPlayer.play(); } catch (_) {}
+    els.startPlayback.hidden = true;
+    setStatus("連続再生中", "live");
+  });
+
   els.logout.addEventListener("click", () => {
     sessionStorage.removeItem("twitch_access_token");
     token = ""; userId = ""; current = null; liveStreams = [];
-    els.player.src = "about:blank"; els.player.hidden = true; els.empty.hidden = false;
+    if (twitchPlayer && playerReady) {
+      try { twitchPlayer.pause(); twitchPlayer.setMuted(true); } catch (_) {}
+    }
+    sessionStorage.removeItem("twitch_audio_activated");
+    audioActivated = false;
+    els.twitchPlayer.hidden = true; els.startPlayback.hidden = true; els.empty.hidden = false;
     els.empty.innerHTML = `<div><div style="font-size:42px">🐧</div><strong>ログアウトしました</strong></div>`;
     els.streamInfo.hidden = true; els.open.disabled = true;
     updateAuthUI(false);
