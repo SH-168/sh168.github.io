@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Twitch Endless Follow TV</title>
+  <style>
+    :root{
+      color-scheme: dark;
+      --bg:#0e0e10; --panel:#18181b; --panel2:#1f1f23;
+      --text:#efeff1; --muted:#adadb8; --accent:#9147ff;
+      --border:#2f2f35; --danger:#eb0400;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    header h1{font-size:18px;margin:0;margin-right:auto}
+    button,input{font:inherit}
+    button{border:0;border-radius:8px;padding:9px 13px;background:var(--panel2);color:var(--text);cursor:pointer}
+    button:hover{filter:brightness(1.15)}
+    button.primary{background:var(--accent);font-weight:700}
+    button.danger{background:#4b1717}
+    button:disabled{opacity:.45;cursor:not-allowed}
+    main{max-width:1500px;margin:0 auto;padding:16px}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:14px}
+    .setup{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}
+    label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}
+    input[type=text]{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#0e0e10;color:var(--text)}
+    .hint{font-size:12px;color:var(--muted);line-height:1.6;margin-top:8px}
+    .status{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .dot{width:9px;height:9px;border-radius:50%;background:#666}
+    .dot.live{background:#00c46a;box-shadow:0 0 10px #00c46a}
+    .dot.wait{background:#f0b429}
+    .meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:13px}
+    .now{font-size:18px;font-weight:700;margin:8px 0 3px}
+    .title{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .player-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+    iframe{width:100%;height:100%;border:0}
+    .empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    .small{font-size:12px;color:var(--muted)}
+    code{background:#111;padding:2px 5px;border-radius:4px}
+    @media (max-width:700px){.setup{grid-template-columns:1fr}.player-wrap{aspect-ratio:9/16;max-height:75vh}}
+  </style>
+</head>
+<body>
+<header>
+  <h1>📺 Twitch Endless Follow TV</h1>
+  <button id="loginBtn" class="primary">Twitchでログイン</button>
+  <button id="logoutBtn" class="danger" hidden>ログアウト</button>
+</header>
+
+<main>
+  <section id="setupCard" class="card">
+    <div class="setup">
+      <div>
+        <label for="clientId">Twitch Client ID</label>
+        <input id="clientId" type="text" placeholder="Twitch Developer Console の Client ID" autocomplete="off" />
+      </div>
+      <button id="saveBtn">保存</button>
+    </div>
+    <div class="hint">
+      Client Secret は不要です。Twitch Developer Console でアプリを作成し、
+      OAuth Redirect URL に <code id="redirectPreview"></code> を登録してください。
+      このページは Twitch Embed の仕様上、HTTPS で公開して使うのがおすすめです。
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="status">
+      <span id="statusDot" class="dot"></span>
+      <strong id="statusText">未ログイン</strong>
+      <span class="small" id="pollText"></span>
+    </div>
+    <div id="streamInfo" hidden>
+      <div class="now" id="streamerName"></div>
+      <div class="title" id="streamTitle"></div>
+      <div class="meta">
+        <span id="gameName"></span>
+        <span id="viewerCount"></span>
+        <span id="liveCount"></span>
+      </div>
+    </div>
+  </section>
+
+  <div class="player-wrap">
+    <div id="emptyState" class="empty">
+      <div>
+        <div style="font-size:42px">🐧</div>
+        <strong>フォロー中のLIVEを自動選局します</strong><br>
+        ログイン後、配信中がいなければ待機して定期巡回します。
+      </div>
+    </div>
+    <iframe id="player" allowfullscreen allow="autoplay; fullscreen" hidden></iframe>
+  </div>
+
+  <div class="controls">
+    <button id="nextBtn" disabled>⏭ 次のLIVE</button>
+    <button id="refreshBtn" disabled>↻ 今すぐ再チェック</button>
+    <button id="openBtn" disabled>↗ Twitchで開く</button>
+  </div>
+  <p class="small">
+    60秒ごとにフォロー中LIVEを再取得します。現在の配信が終了したら別のLIVEへ自動切替。
+    誰も配信していない場合は待機を続けます。
+  </p>
+</main>
+
+<script>
+(() => {
+  const POLL_MS = 60_000;
+  const SCOPE = "user:read:follows";
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    clientId: $("clientId"), login: $("loginBtn"), logout: $("logoutBtn"),
+    save: $("saveBtn"), setup: $("setupCard"), statusDot: $("statusDot"),
+    statusText: $("statusText"), pollText: $("pollText"), player: $("player"),
+    empty: $("emptyState"), next: $("nextBtn"), refresh: $("refreshBtn"),
+    open: $("openBtn"), streamInfo: $("streamInfo"), streamerName: $("streamerName"),
+    streamTitle: $("streamTitle"), gameName: $("gameName"),
+    viewerCount: $("viewerCount"), liveCount: $("liveCount"),
+    redirectPreview: $("redirectPreview")
+  };
+
+  let token = sessionStorage.getItem("twitch_access_token") || "";
+  let userId = "";
+  let current = null;
+  let liveStreams = [];
+  let pollTimer = null;
+  let countdownTimer = null;
+  let nextPollAt = 0;
+
+  const redirectUri = location.origin + location.pathname;
+  els.redirectPreview.textContent = redirectUri;
+  els.clientId.value = localStorage.getItem("twitch_client_id") || "";
+
+  function setStatus(text, mode="") {
+    els.statusText.textContent = text;
+    els.statusDot.className = "dot" + (mode ? " " + mode : "");
+  }
+
+  function saveClientId() {
+    const id = els.clientId.value.trim();
+    if (!id) return alert("Client ID を入力してね。");
+    localStorage.setItem("twitch_client_id", id);
+    return id;
+  }
+
+  function parseOAuthHash() {
+    const params = new URLSearchParams(location.hash.slice(1));
+    const access = params.get("access_token");
+    const error = params.get("error_description") || params.get("error");
+    if (error) {
+      history.replaceState(null, "", location.pathname + location.search);
+      alert("Twitchログインに失敗しました: " + error);
+      return;
+    }
+    if (access) {
+      sessionStorage.setItem("twitch_access_token", access);
+      token = access;
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+  }
+
+  async function validateToken() {
+    if (!token) return false;
+    const res = await fetch("https://id.twitch.tv/oauth2/validate", {
+      headers: { Authorization: "OAuth " + token }
+    });
+    if (!res.ok) {
+      sessionStorage.removeItem("twitch_access_token");
+      token = "";
+      return false;
+    }
+    const data = await res.json();
+    const configuredClientId = localStorage.getItem("twitch_client_id") || "";
+    if (configuredClientId && data.client_id !== configuredClientId) {
+      sessionStorage.removeItem("twitch_access_token");
+      token = "";
+      throw new Error("保存中のClient IDとアクセストークンのClient IDが一致しません。再ログインしてください。");
+    }
+    if (!data.scopes?.includes(SCOPE)) {
+      sessionStorage.removeItem("twitch_access_token");
+      token = "";
+      throw new Error("必要な権限 user:read:follows がありません。再ログインしてください。");
+    }
+    userId = data.user_id;
+    return true;
+  }
+
+  async function api(path) {
+    const clientId = localStorage.getItem("twitch_client_id");
+    const res = await fetch("https://api.twitch.tv/helix" + path, {
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Client-Id": clientId
+      }
+    });
+    if (res.status === 401) {
+      sessionStorage.removeItem("twitch_access_token");
+      token = "";
+      throw new Error("Twitchログインの有効期限が切れました。再ログインしてください。");
+    }
+    if (!res.ok) throw new Error("Twitch API error: " + res.status + " " + await res.text());
+    return res.json();
+  }
+
+  async function fetchAllFollowedLive() {
+    let all = [], cursor = "";
+    do {
+      const q = new URLSearchParams({ user_id: userId, first: "100" });
+      if (cursor) q.set("after", cursor);
+      const data = await api("/streams/followed?" + q.toString());
+      all.push(...data.data);
+      cursor = data.pagination?.cursor || "";
+      // 視聴者数変動によるページング重複対策
+      all = Array.from(new Map(all.map(x => [x.id, x])).values());
+    } while (cursor);
+    return all;
+  }
+
+  function pickRandom(excludeLogin = "") {
+    let pool = liveStreams.filter(s => s.user_login !== excludeLogin);
+    if (!pool.length) pool = liveStreams;
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  function showStream(s) {
+    current = s;
+    els.streamInfo.hidden = false;
+    els.streamerName.textContent = s.user_name;
+    els.streamTitle.textContent = s.title || "タイトルなし";
+    els.gameName.textContent = "🎮 " + (s.game_name || "カテゴリなし");
+    els.viewerCount.textContent = "👀 " + Number(s.viewer_count).toLocaleString() + "人";
+    els.liveCount.textContent = "🟣 フォロー中LIVE " + liveStreams.length + "件";
+    els.open.disabled = false;
+    setStatus("再生中", "live");
+
+    // Twitch Embed の parent は現在のホスト名を指定
+    const params = new URLSearchParams({
+      channel: s.user_login,
+      parent: location.hostname,
+      autoplay: "true",
+      muted: "false"
+    });
+    els.player.src = "https://player.twitch.tv/?" + params.toString();
+    els.player.hidden = false;
+    els.empty.hidden = true;
+    document.title = "▶ " + s.user_name + " | Twitch Endless Follow TV";
+  }
+
+  function showWaiting() {
+    current = null;
+    els.player.src = "about:blank";
+    els.player.hidden = true;
+    els.empty.hidden = false;
+    els.empty.innerHTML = `<div><div style="font-size:42px">🐧💤</div><strong>いま配信中のフォロー先はいません</strong><br>そのまま待機して、自動で見つけにいきます。</div>`;
+    els.streamInfo.hidden = true;
+    els.open.disabled = true;
+    setStatus("LIVE待機中", "wait");
+    document.title = "待機中 | Twitch Endless Follow TV";
+  }
+
+  async function refresh({forcePick=false} = {}) {
+    if (!token || !userId) return;
+    els.refresh.disabled = true;
+    try {
+      liveStreams = await fetchAllFollowedLive();
+
+      if (!liveStreams.length) {
+        showWaiting();
+      } else if (forcePick) {
+        showStream(pickRandom(current?.user_login || ""));
+      } else if (!current) {
+        showStream(pickRandom());
+      } else {
+        const stillLive = liveStreams.find(s => s.user_login === current.user_login);
+        if (!stillLive) {
+          showStream(pickRandom(current.user_login));
+        } else {
+          current = stillLive;
+          els.viewerCount.textContent = "👀 " + Number(stillLive.viewer_count).toLocaleString() + "人";
+          els.liveCount.textContent = "🟣 フォロー中LIVE " + liveStreams.length + "件";
+        }
+      }
+      schedulePoll();
+    } catch (e) {
+      console.error(e);
+      setStatus("エラー", "");
+      els.pollText.textContent = e.message;
+      if (!token) updateAuthUI(false);
+      else schedulePoll();
+    } finally {
+      els.refresh.disabled = !token;
+    }
+  }
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    clearInterval(countdownTimer);
+    nextPollAt = Date.now() + POLL_MS;
+    pollTimer = setTimeout(() => refresh(), POLL_MS);
+    countdownTimer = setInterval(() => {
+      const sec = Math.max(0, Math.ceil((nextPollAt - Date.now()) / 1000));
+      els.pollText.textContent = `次回チェックまで ${sec}秒`;
+    }, 1000);
+  }
+
+  function updateAuthUI(loggedIn) {
+    els.login.hidden = loggedIn;
+    els.logout.hidden = !loggedIn;
+    els.next.disabled = !loggedIn;
+    els.refresh.disabled = !loggedIn;
+    els.setup.hidden = loggedIn;
+    if (!loggedIn) {
+      clearTimeout(pollTimer); clearInterval(countdownTimer);
+      setStatus("未ログイン");
+      els.pollText.textContent = "";
+    }
+  }
+
+  els.save.addEventListener("click", () => {
+    if (saveClientId()) alert("Client ID を保存しました。");
+  });
+
+  els.login.addEventListener("click", () => {
+    const clientId = saveClientId();
+    if (!clientId) return;
+    if (location.protocol !== "https:" && location.hostname !== "localhost") {
+      alert("Twitch Embed/OAuth用に、HTTPSで公開したURLから使うのがおすすめです。");
+    }
+    const q = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "token",
+      scope: SCOPE
+    });
+    location.href = "https://id.twitch.tv/oauth2/authorize?" + q.toString();
+  });
+
+  els.logout.addEventListener("click", () => {
+    sessionStorage.removeItem("twitch_access_token");
+    token = ""; userId = ""; current = null; liveStreams = [];
+    els.player.src = "about:blank"; els.player.hidden = true; els.empty.hidden = false;
+    els.empty.innerHTML = `<div><div style="font-size:42px">🐧</div><strong>ログアウトしました</strong></div>`;
+    els.streamInfo.hidden = true; els.open.disabled = true;
+    updateAuthUI(false);
+  });
+
+  els.next.addEventListener("click", () => refresh({forcePick:true}));
+  els.refresh.addEventListener("click", () => refresh());
+
+  els.open.addEventListener("click", () => {
+    if (current) window.open("https://www.twitch.tv/" + current.user_login, "_blank", "noopener,noreferrer");
+  });
+
+  (async function init() {
+    parseOAuthHash();
+    try {
+      if (await validateToken()) {
+        updateAuthUI(true);
+        setStatus("Twitch接続済み", "live");
+        await refresh();
+      } else {
+        updateAuthUI(false);
+      }
+    } catch (e) {
+      console.error(e);
+      updateAuthUI(false);
+      els.pollText.textContent = e.message;
+    }
+  })();
+})();
+</script>
+</body>
+</html>
