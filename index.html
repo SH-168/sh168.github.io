@@ -35,8 +35,10 @@
     .now{font-size:18px;font-weight:700;margin:8px 0 3px}
     .title{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .player-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
-    iframe{width:100%;height:100%;border:0}\n    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;}
-    .empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
+    iframe{width:100%;height:100%;border:0}
+    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;pointer-events:auto!important;}
+    #twitchPlayer iframe{pointer-events:auto!important;}
+    .empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted);pointer-events:none}
     .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
     .small{font-size:12px;color:var(--muted)}
     code{background:#111;padding:2px 5px;border-radius:4px}
@@ -93,13 +95,10 @@
       </div>
     </div>
     <div id="twitchPlayer" style="width:100%;height:100%;" hidden></div>
-    <button id="startPlaybackBtn" class="primary" hidden
-      style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:20;padding:14px 20px;font-size:16px;">
-      ▶ 再生開始（音声ON）
-    </button>
   </div>
 
   <div class="controls">
+    <button id="startPlaybackBtn" class="primary" hidden>🔊 音声ONで連続再生</button>
     <button id="nextBtn" disabled>⏭ 次のLIVE</button>
     <button id="refreshBtn" disabled>↻ 今すぐ再チェック</button>
     <button id="backgroundBtn" disabled>📻 BG監視 ON</button>
@@ -107,9 +106,9 @@
     <span id="backgroundState" class="small">BG監視: OFF</span>
   </div>
   <p class="small">
-    ページを開いたら最初の1回だけ「▶ 再生開始（音声ON）」を押してください。
-    v4は自動再生を使わず、普通の音あり再生として開始します。その後は同じTwitch Playerのまま自動選局します。<br>
-    BG監視をONにすると、別タブ中でもAPI再チェック用の軽いWorkerを動かします。
+    Twitchプレイヤーの上には操作UIを一切重ねません。まずミュートで再生し、
+    下の「🔊 音声ONで連続再生」を1回だけ押してください。その後は同じPlayerのまま自動選局します。<br>
+    BG監視ONでは、別タブ中に通常の60秒チェックが遅れた時だけWorkerが補助します。
     誰も配信していない場合は待機を続けます。
   </p>
 </main>
@@ -141,10 +140,8 @@
   let nextPollAt = 0;
   let twitchPlayer = null;
   let playerReady = false;
-  // v4: no autoplay-policy gymnastics.
-  // Each page load starts stopped and unmuted; one explicit click starts playback.
+  // User activation is page-load scoped. Never inherit it after reload.
   let audioActivated = false;
-  let playbackStarted = false;
   let backgroundWatch = localStorage.getItem("twitch_bg_watch") === "1";
   let bgWorker = null;
   let refreshBusy = false;
@@ -255,34 +252,35 @@
       height: "100%",
       channel: initialChannel,
       parent: [location.hostname],
-      autoplay: false,
-      muted: false
+      autoplay: true,
+      muted: true
     });
 
     twitchPlayer.addEventListener(Twitch.Player.READY, () => {
       playerReady = true;
-      playbackStarted = false;
       audioActivated = false;
-      try { twitchPlayer.setMuted(false); } catch (_) {}
+      // Reliable browser path: start muted first.
+      try {
+        twitchPlayer.setMuted(true);
+        twitchPlayer.play();
+      } catch (_) {}
       els.startPlayback.hidden = false;
-      setStatus("▶ を押して再生してください", "wait");
+      setStatus("ミュート再生中 → 下の「音声ON」を1回押してください", "wait");
     });
 
     twitchPlayer.addEventListener(Twitch.Player.PLAYING, () => {
-      playbackStarted = true;
-      audioActivated = true;
-      els.startPlayback.hidden = true;
-      if (current) setStatus("連続再生中", "live");
+      if (current) {
+        setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
+      }
     });
 
     twitchPlayer.addEventListener(Twitch.Player.PLAYBACK_BLOCKED, () => {
-      playbackStarted = false;
+      audioActivated = false;
       els.startPlayback.hidden = false;
-      setStatus("▶ を押して再生してください", "wait");
+      setStatus("再生が止められました。下の「音声ON」を押してください", "wait");
     });
 
     twitchPlayer.addEventListener(Twitch.Player.OFFLINE, () => {
-      playbackStarted = false;
       if (current) {
         setStatus("配信終了 → 次を探しています…", "wait");
         setTimeout(() => refresh({forcePick:true}), 1200);
@@ -290,7 +288,6 @@
     });
 
     twitchPlayer.addEventListener(Twitch.Player.ENDED, () => {
-      playbackStarted = false;
       if (current) setTimeout(() => refresh({forcePick:true}), 1200);
     });
 
@@ -307,8 +304,7 @@
     els.viewerCount.textContent = "👀 " + Number(s.viewer_count).toLocaleString() + "人";
     els.liveCount.textContent = "🟣 フォロー中LIVE " + liveStreams.length + "件";
     els.open.disabled = false;
-    setStatus(playbackStarted ? "連続再生中" : "▶ を押して再生してください",
-              playbackStarted ? "live" : "wait");
+    setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
 
     els.empty.hidden = true;
     els.twitchPlayer.hidden = false;
@@ -316,16 +312,10 @@
     if (!twitchPlayer) {
       ensurePlayer(s.user_login);
     } else if (previousLogin !== s.user_login) {
-      playbackStarted = false;
       twitchPlayer.setChannel(s.user_login);
-
-      // Once the user has explicitly started playback on this page,
-      // keep the same Twitch Player and start the newly selected channel.
-      if (playerReady && audioActivated) {
-        try {
-          twitchPlayer.setMuted(false);
-          twitchPlayer.play();
-        } catch (_) {}
+      if (playerReady) {
+        twitchPlayer.setMuted(!audioActivated);
+        try { twitchPlayer.play(); } catch (_) {}
       }
     }
 
@@ -357,34 +347,21 @@
 
   function startBgWorker() {
     if (!backgroundWatch || bgWorker) return;
-
     const code = `
-      let t = setInterval(() => postMessage("tick"), 15000);
+      const timer = setInterval(() => postMessage("tick"), 15000);
       onmessage = (e) => {
-        if (e.data === "stop") {
-          clearInterval(t);
-          close();
-        }
+        if (e.data === "stop") { clearInterval(timer); close(); }
       };
     `;
     const url = URL.createObjectURL(new Blob([code], {type:"text/javascript"}));
     bgWorker = new Worker(url);
-
-    // Revoke only after the worker has had time to load.
     setTimeout(() => URL.revokeObjectURL(url), 5000);
 
     bgWorker.onmessage = () => {
-      if (!backgroundWatch || !token || !userId) return;
-      // Only refresh if the normal 60s schedule is overdue.
-      if (nextPollAt && Date.now() >= nextPollAt && !refreshBusy) {
-        refresh();
-      }
+      if (!backgroundWatch || !token || !userId || refreshBusy) return;
+      if (nextPollAt && Date.now() >= nextPollAt) refresh();
     };
-
-    bgWorker.onerror = (err) => {
-      console.warn("BG worker disabled:", err);
-      stopBgWorker();
-    };
+    bgWorker.onerror = () => stopBgWorker();
   }
 
   function stopBgWorker() {
@@ -395,9 +372,7 @@
 
   async function refreshOnReturn() {
     if (!token || !userId || refreshBusy) return;
-    if (!lastApiRefresh || Date.now() - lastApiRefresh > 10000) {
-      await refresh();
-    }
+    if (!lastApiRefresh || Date.now() - lastApiRefresh > 10000) await refresh();
   }
 
   async function refresh({forcePick=false} = {}) {
@@ -485,32 +460,23 @@
 
   els.startPlayback.addEventListener("click", () => {
     if (!twitchPlayer || !playerReady) {
-      setStatus("プレイヤー準備中…もう一度押してください", "wait");
+      setStatus("プレイヤー準備中です。少し待ってもう一度押してください", "wait");
       return;
     }
 
-    // Direct user gesture: start ordinary audible playback.
-    // autoplay=false + muted=false means we don't rely on browser autoplay permission.
+    // Direct user gesture: unmute the already-running Twitch player.
     try {
       twitchPlayer.setMuted(false);
       twitchPlayer.setVolume(1);
       twitchPlayer.play();
       audioActivated = true;
       els.startPlayback.hidden = true;
-      setStatus("再生開始中…", "wait");
+      setStatus("連続再生中", "live");
     } catch (_) {
       audioActivated = false;
       els.startPlayback.hidden = false;
-      setStatus("再生できませんでした。Twitch左下の▶でも再生できます", "wait");
+      setStatus("音声ONにできませんでした。もう一度押してください", "wait");
     }
-
-    // PLAYING event is the authority. If it doesn't arrive, restore the button.
-    setTimeout(() => {
-      if (!playbackStarted) {
-        els.startPlayback.hidden = false;
-        setStatus("再生されない場合は、Twitch左下の▶を一度押してください", "wait");
-      }
-    }, 2500);
   });
 
   els.background.addEventListener("click", () => {
@@ -523,7 +489,6 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refreshOnReturn();
   });
-
   window.addEventListener("focus", () => refreshOnReturn());
 
   els.logout.addEventListener("click", () => {
