@@ -23,13 +23,20 @@ input{background:#0e0e10;color:inherit;border:1px solid #444;border-radius:8px;p
 <p class="small">Client Secretは不要です。Twitch Developer ConsoleのOAuth Redirect URLに <code id="redirect"></code> を登録してください。これまでと同じ公開URLのHTMLを差し替える場合、URLの変更は不要です。</p></section>
 <section class="card"><strong id="statusText" role="status">未ログイン</strong> <span id="pollText" class="small"></span><div id="streamInfo" hidden><div id="streamerName" class="now"></div><div id="streamTitle" class="title"></div><div id="meta" class="meta"></div></div></section>
 <div class="player-wrap"><div id="empty" class="empty">🐧 フォロー中のLIVEを自動選局します</div><div id="twitchPlayer" hidden></div></div>
-<div class="controls"><button id="start" class="primary" hidden>🔊 音声ON・再開</button><button id="pause" disabled>一時停止</button><button id="next" disabled>⏭ 次のLIVE</button><button id="refresh" disabled>↻ 今すぐ再チェック</button><button id="background" disabled>📻 再生補助をOFF</button><button id="open" disabled>↗ Twitchで開く</button><span id="backgroundState" class="small"></span></div>
-<p class="small">まず「音声ON・再開」を押し、音が出てから別タブに移動してください。再生補助ONでは、別タブでの一時停止から最大3回の再開を試みます。<br>この画面での手動一時停止は尊重します。別タブからメディアキーなどで停止する場合は先に再生補助をOFFにしてください。<br>Workerは配信チェックの補助です。Twitchの再生制限やブラウザのタブ休止は解除できません。ブロックされた場合はこのタブで再開してください。</p>
+<div class="controls"><button id="start" class="primary" hidden>🔊 音声ON・再開</button><button id="popout">▣ 別ウィンドウで再生</button><button id="pause" disabled>一時停止</button><button id="next" disabled>⏭ 次のLIVE</button><button id="refresh" disabled>↻ 今すぐ再チェック</button><button id="background" disabled>📻 再生補助をOFF</button><button id="open" disabled>↗ Twitchで開く</button><span id="backgroundState" class="small"></span></div>
+<p class="small"><strong>Chromeで別タブに移ると音声も止まる場合：</strong>「別ウィンドウで再生」を押し、開いた画面で「音声ON・再開」を押してください。プレイヤーのウィンドウを画面の端に表示したまま、元のChromeウィンドウで作業してください。最小化や他のウィンドウで完全に覆うと停止する可能性があります。<br>別ウィンドウでもフォロー中のLIVEを自動選局します。元の画面は一時停止します。<br>再生補助ONでは、別タブでの一時停止から最大3回の再開を試みます。<br>この画面での手動一時停止は尊重します。別タブからメディアキーなどで停止する場合は先に再生補助をOFFにしてください。<br>Workerは配信チェックの補助です。Twitchの再生制限やブラウザのタブ休止は解除できません。ブロックされた場合はこのタブで再開してください。</p>
 </main>
 <script>
 (() => {
   const $ = id => document.getElementById(id), POLL_MS = 60000, SCOPE = 'user:read:follows';
   const redirectUri = location.origin + location.pathname;
+  const launch = new URLSearchParams(location.search);
+  let preferredChannel = launch.get('channel') || '';
+  if (launch.get('playerWindow') === '1') {
+    // The browser copies same-origin sessionStorage on opening. No token in URLs.
+    window.opener = null;
+    $('popout').hidden = true;
+  }
   let token = sessionStorage.getItem('twitch_access_token') || '', userId = '';
   let player = null, ready = false, current = null, streams = [];
   let audioActivated = false, manuallyPaused = false, blocked = false, resumeArmed = false;
@@ -183,7 +190,9 @@ input{background:#0e0e10;color:inherit;border:1px solid #444;border-radius:8px;p
       else {
         const others = streams.filter(s => s.user_login !== current?.user_login);
         const pool = others.length ? others : streams;
-        showStream(pool[Math.floor(Math.random()*pool.length)]);
+        const preferred = !current && streams.find(s => s.user_login === preferredChannel);
+        preferredChannel = '';
+        showStream(preferred || pool[Math.floor(Math.random()*pool.length)]);
       }
     } catch (e) {
       if (session !== epoch) return;
@@ -231,6 +240,26 @@ input{background:#0e0e10;color:inherit;border:1px solid #444;border-radius:8px;p
     audioActivated = true; manuallyPaused = false; blocked = false; resumeArmed = true; attempts = 0; lastAttempt = 0;
     try { player.setMuted(false); if (player.getVolume() === 0) player.setVolume(0.7); status('音声ONで再生を開始しています…','wait'); player.play(); }
     catch (_) { audioActivated = false; resumeArmed = false; status('もう一度「音声ON・再開」を押してください','wait'); }
+  };
+  $('popout').onclick = () => {
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+      alert('現在使っているHTTPSの公開先にこのHTMLを設置してから開いてください。');
+      return;
+    }
+    const url = new URL(location.href);
+    url.hash = '';
+    url.searchParams.set('playerWindow','1');
+    if (current) url.searchParams.set('channel',current.user_login);
+    // Open only our own page, preserving sessionStorage for Twitch login.
+    const popup = window.open(url.href,'_blank','popup=yes,width=800,height=850,resizable=yes,scrollbars=yes');
+    if (!popup) {
+      status('ポップアップがブロックされました。Chromeでこのサイトのポップアップを許可してください。','wait');
+      return;
+    }
+    manuallyPaused = true; resumeArmed = false;
+    if (ready) player.pause();
+    $('start').hidden = !current;
+    status('別ウィンドウを開きました。そちらで「音声ON・再開」を押してください。','wait');
   };
   $('pause').onclick = () => { manuallyPaused = true; resumeArmed = false; if (ready) player.pause(); };
   $('next').onclick = () => refresh(true); $('refresh').onclick = () => refresh();
