@@ -12,7 +12,6 @@
       --border:#2f2f35; --danger:#eb0400;
     }
     *{box-sizing:border-box}
-    [hidden]{display:none !important}
     body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
     header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
     header h1{font-size:18px;margin:0;margin-right:auto}
@@ -36,11 +35,17 @@
     .now{font-size:18px;font-weight:700;margin:8px 0 3px}
     .title{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .player-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
-    iframe{width:100%;height:100%;border:0}
-    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;}
-    .empty{pointer-events:none;position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
+    iframe{width:100%;height:100%;border:0}\n    #twitchPlayer{position:absolute;inset:0;width:100%;height:100%;}
+    .empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;color:var(--muted)}
     .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
     .small{font-size:12px;color:var(--muted)}
+    .mode-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;background:#222228;color:var(--muted);font-size:12px}
+    .mode-badge.on{color:#b9f6ca;background:#123524}
+    body.background-mode header, body.background-mode #setupCard{display:none}
+    body.background-mode main{max-width:none;padding:8px}
+    body.background-mode .card{padding:9px;margin-bottom:8px}
+    body.background-mode .controls{opacity:.82}
+    body.background-mode .player-wrap{max-height:calc(100vh - 150px)}
     code{background:#111;padding:2px 5px;border-radius:4px}
     @media (max-width:700px){.setup{grid-template-columns:1fr}.player-wrap{aspect-ratio:9/16;max-height:75vh}}
   </style>
@@ -95,19 +100,23 @@
       </div>
     </div>
     <div id="twitchPlayer" style="width:100%;height:100%;" hidden></div>
-
+    <button id="startPlaybackBtn" class="primary" hidden
+      style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:20;padding:14px 20px;font-size:16px;">
+      ▶ 音声ONで連続再生
+    </button>
   </div>
 
   <div class="controls">
-    <button id="startPlaybackBtn" class="primary" hidden disabled>▶ 音声ONで再生</button>
     <button id="nextBtn" disabled>⏭ 次のLIVE</button>
     <button id="refreshBtn" disabled>↻ 今すぐ再チェック</button>
+    <button id="backgroundBtn" disabled>📻 バックグラウンドモード</button>
     <button id="openBtn" disabled>↗ Twitchで開く</button>
+    <span id="backgroundBadge" class="mode-badge">● 通常モード</span>
   </div>
   <p class="small">
-    「▶ 音声ONで再生」を押してください。再生が始まらない場合は、動画左下の▶とスピーカーを直接操作してください。<br>
-    配信の切替には同じプレイヤーを使います。ブラウザの制限により、再度操作が必要になる場合があります。<br>
-    60秒ごとにフォロー中LIVEを再取得します。現在の配信が終了したら別のLIVEへ自動切替。
+    初回だけ「▶ 音声ONで連続再生」を押してください。その後は同じTwitch Playerのままチャンネルを切り替えます。<br>
+    PCバックグラウンド対策として、Web Workerが15秒ごとに見張り、60秒ごとにフォロー中LIVEを再取得します。
+    タブへ戻った時・ウィンドウへフォーカスした時にも即チェックします。現在の配信が終了したら別のLIVEへ自動切替。
     誰も配信していない場合は待機を続けます。
   </p>
 </main>
@@ -126,7 +135,8 @@
     open: $("openBtn"), streamInfo: $("streamInfo"), streamerName: $("streamerName"),
     streamTitle: $("streamTitle"), gameName: $("gameName"),
     viewerCount: $("viewerCount"), liveCount: $("liveCount"),
-    redirectPreview: $("redirectPreview")
+    redirectPreview: $("redirectPreview"), background: $("backgroundBtn"),
+    backgroundBadge: $("backgroundBadge")
   };
 
   let token = sessionStorage.getItem("twitch_access_token") || "";
@@ -138,7 +148,11 @@
   let nextPollAt = 0;
   let twitchPlayer = null;
   let playerReady = false;
-  let audioActivated = false; // ページを開くたびに音声付き再生の許可を確認する
+  let audioActivated = sessionStorage.getItem("twitch_audio_activated") === "1";
+  let backgroundMode = localStorage.getItem("twitch_background_mode") === "1";
+  let heartbeatWorker = null;
+  let refreshInFlight = false;
+  let lastRefreshAt = 0;
 
   const redirectUri = location.origin + location.pathname;
   els.redirectPreview.textContent = redirectUri;
@@ -239,9 +253,7 @@
   function ensurePlayer(initialChannel) {
     if (twitchPlayer) return twitchPlayer;
 
-    if (!window.Twitch?.Player) throw new Error("Twitchプレイヤーを読み込めません。ページを再読み込みしてください。");
     els.twitchPlayer.hidden = false;
-    els.startPlayback.disabled = true;
     twitchPlayer = new Twitch.Player("twitchPlayer", {
       width: "100%",
       height: "100%",
@@ -253,33 +265,18 @@
 
     twitchPlayer.addEventListener(Twitch.Player.READY, () => {
       playerReady = true;
-      els.startPlayback.disabled = false;
-      if (!current) { twitchPlayer.pause(); return; }
-      twitchPlayer.setChannel(current.user_login);
-      twitchPlayer.setMuted(true);
-      els.startPlayback.hidden = false;
-      try { twitchPlayer.play(); } catch (_) {
-        setStatus("動画左下の▶で再生してください", "wait");
-      }
+      twitchPlayer.setMuted(!audioActivated);
+      try { twitchPlayer.play(); } catch (_) {}
+      if (!audioActivated) els.startPlayback.hidden = false;
     });
 
     twitchPlayer.addEventListener(Twitch.Player.PLAYING, () => {
-      if (!current) { twitchPlayer.pause(); return; }
-      audioActivated = !twitchPlayer.getMuted();
-      els.startPlayback.hidden = audioActivated;
-      setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
+      if (current) setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
     });
 
     twitchPlayer.addEventListener(Twitch.Player.PLAYBACK_BLOCKED, () => {
       els.startPlayback.hidden = false;
-      setStatus("再生がブロックされました。動画左下の▶とスピーカーを直接操作してください", "wait");
-    });
-
-    twitchPlayer.addEventListener(Twitch.Player.PAUSE, () => {
-      if (current) {
-        els.startPlayback.hidden = false;
-        setStatus("一時停止中 — 動画左下の▶で再開できます", "wait");
-      }
+      setStatus("再生には最初の1クリックが必要です", "wait");
     });
 
     twitchPlayer.addEventListener(Twitch.Player.OFFLINE, () => {
@@ -306,7 +303,7 @@
     els.viewerCount.textContent = "👀 " + Number(s.viewer_count).toLocaleString() + "人";
     els.liveCount.textContent = "🟣 フォロー中LIVE " + liveStreams.length + "件";
     els.open.disabled = false;
-    setStatus("配信を読み込み中…", "wait");
+    setStatus(audioActivated ? "連続再生中" : "ミュート再生中", "live");
 
     els.empty.hidden = true;
     els.twitchPlayer.hidden = false;
@@ -314,15 +311,17 @@
     if (!twitchPlayer) {
       ensurePlayer(s.user_login);
     } else if (previousLogin !== s.user_login) {
+      twitchPlayer.setChannel(s.user_login);
       if (playerReady) {
-        twitchPlayer.setChannel(s.user_login);
         twitchPlayer.setMuted(!audioActivated);
         try { twitchPlayer.play(); } catch (_) {}
       }
+      // バックグラウンドタブでも次の選局を維持するためPlayer自体は破棄しない。
     }
 
     els.startPlayback.hidden = audioActivated;
     document.title = "▶ " + s.user_name + " | Twitch Endless Follow TV";
+    if (backgroundMode) els.backgroundBadge.textContent = "● BG再生: " + s.user_name;
   }
 
   function showWaiting() {
@@ -340,11 +339,68 @@
     document.title = "待機中 | Twitch Endless Follow TV";
   }
 
-  async function refresh({forcePick=false} = {}) {
+
+  function applyBackgroundMode() {
+    document.body.classList.toggle("background-mode", backgroundMode);
+    els.backgroundBadge.textContent = backgroundMode ? "● バックグラウンド強化ON" : "● 通常モード";
+    els.backgroundBadge.classList.toggle("on", backgroundMode);
+    els.background.textContent = backgroundMode ? "🖥 通常表示に戻す" : "📻 バックグラウンドモード";
+    localStorage.setItem("twitch_background_mode", backgroundMode ? "1" : "0");
+  }
+
+  function startHeartbeatWorker() {
+    if (heartbeatWorker) return;
+
+    // Blob Worker: hidden tabで通常タイマーが間引かれても、一定間隔で本体に合図する。
+    const workerCode = `
+      let timer = null;
+      function start() {
+        clearInterval(timer);
+        timer = setInterval(() => postMessage({type:"tick", now:Date.now()}), 15000);
+        postMessage({type:"tick", now:Date.now()});
+      }
+      onmessage = (e) => {
+        if (e.data === "start") start();
+        if (e.data === "stop") clearInterval(timer);
+      };
+      start();
+    `;
+    const blob = new Blob([workerCode], {type:"text/javascript"});
+    const workerUrl = URL.createObjectURL(blob);
+    heartbeatWorker = new Worker(workerUrl);
+    URL.revokeObjectURL(workerUrl);
+
+    heartbeatWorker.onmessage = (e) => {
+      if (e.data?.type !== "tick" || !token || !userId) return;
+
+      // schedulePollのsetTimeoutがhidden tabで遅延しても、
+      // 予定時刻を過ぎていたらWorkerからrefreshを起こす。
+      if (nextPollAt && Date.now() >= nextPollAt) {
+        refresh({reason:"worker"});
+      }
+    };
+  }
+
+  function stopHeartbeatWorker() {
+    if (!heartbeatWorker) return;
+    try { heartbeatWorker.postMessage("stop"); heartbeatWorker.terminate(); } catch (_) {}
+    heartbeatWorker = null;
+  }
+
+  async function refreshIfStale(reason="resume") {
     if (!token || !userId) return;
+    // 短時間に visibilitychange / focus / pageshow が連続してもAPIを連打しない。
+    const stale = !lastRefreshAt || (Date.now() - lastRefreshAt > 10_000);
+    if (stale) await refresh({reason});
+  }
+
+  async function refresh({forcePick=false, reason="timer"} = {}) {
+    if (!token || !userId || refreshInFlight) return;
+    refreshInFlight = true;
     els.refresh.disabled = true;
     try {
       liveStreams = await fetchAllFollowedLive();
+      lastRefreshAt = Date.now();
 
       if (!liveStreams.length) {
         showWaiting();
@@ -370,6 +426,7 @@
       if (!token) updateAuthUI(false);
       else schedulePoll();
     } finally {
+      refreshInFlight = false;
       els.refresh.disabled = !token;
     }
   }
@@ -378,7 +435,8 @@
     clearTimeout(pollTimer);
     clearInterval(countdownTimer);
     nextPollAt = Date.now() + POLL_MS;
-    pollTimer = setTimeout(() => refresh(), POLL_MS);
+    // Visible tabではこれが普通に動く。hidden時に遅延してもWorkerが補完する。
+    pollTimer = setTimeout(() => refresh({reason:"timeout"}), POLL_MS);
     countdownTimer = setInterval(() => {
       const sec = Math.max(0, Math.ceil((nextPollAt - Date.now()) / 1000));
       els.pollText.textContent = `次回チェックまで ${sec}秒`;
@@ -390,7 +448,10 @@
     els.logout.hidden = !loggedIn;
     els.next.disabled = !loggedIn;
     els.refresh.disabled = !loggedIn;
+    els.background.disabled = !loggedIn;
     els.setup.hidden = loggedIn;
+    if (loggedIn) startHeartbeatWorker();
+    else stopHeartbeatWorker();
     if (!loggedIn) {
       clearTimeout(pollTimer); clearInterval(countdownTimer);
       setStatus("未ログイン");
@@ -418,26 +479,42 @@
   });
 
   els.startPlayback.addEventListener("click", () => {
-    if (!twitchPlayer || !playerReady || !current) return;
-    setStatus("音声付き再生を開始しています…", "wait");
-    try {
-      twitchPlayer.setMuted(false);
-      twitchPlayer.setVolume(1);
-      twitchPlayer.play();
-      audioActivated = true;
-      if (!twitchPlayer.isPaused()) {
-        els.startPlayback.hidden = true;
-        setStatus("連続再生中", "live");
-      }
-    } catch (e) {
-      els.startPlayback.hidden = false;
-      setStatus("動画左下の▶とスピーカーを直接操作してください", "wait");
-    }
+    if (!twitchPlayer) return;
+    audioActivated = true;
+    sessionStorage.setItem("twitch_audio_activated", "1");
+    twitchPlayer.setMuted(false);
+    try { twitchPlayer.play(); } catch (_) {}
+    els.startPlayback.hidden = true;
+    setStatus("連続再生中", "live");
   });
+
+  els.background.addEventListener("click", () => {
+    backgroundMode = !backgroundMode;
+    applyBackgroundMode();
+    // モード切替でプレイヤーは破棄しない。音声・選局を維持。
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshIfStale("visibility");
+  });
+
+  window.addEventListener("focus", () => refreshIfStale("focus"));
+  window.addEventListener("pageshow", () => refreshIfStale("pageshow"));
+
+  // PCがスリープ→復帰した場合など、時間が大きく飛んだら即再同期。
+  let lastHeartbeatClock = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    if (now - lastHeartbeatClock > 90_000 && token && userId) {
+      refresh({reason:"wake"});
+    }
+    lastHeartbeatClock = now;
+  }, 30_000);
 
   els.logout.addEventListener("click", () => {
     sessionStorage.removeItem("twitch_access_token");
     token = ""; userId = ""; current = null; liveStreams = [];
+    lastRefreshAt = 0; refreshInFlight = false;
     if (twitchPlayer && playerReady) {
       try { twitchPlayer.pause(); twitchPlayer.setMuted(true); } catch (_) {}
     }
@@ -457,6 +534,7 @@
   });
 
   (async function init() {
+    applyBackgroundMode();
     parseOAuthHash();
     try {
       if (await validateToken()) {
